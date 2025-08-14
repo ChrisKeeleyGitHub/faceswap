@@ -114,7 +114,8 @@ class TrainArgs(FaceSwapArgs):
                 "unbalanced so B>A swaps won't work so well. Very configurable."
                 "\nL|villain: 128px in/out model from villainguy. Very resource hungry (You will "
                 "require a GPU with a fair amount of VRAM). Good for details, but more "
-                "susceptible to color differences.")})
+                "susceptible to color differences."
+                "\nL|phaze-a-custom: Customizable Phaze-A model exposing additional upscalers.")})
         argument_list.append({
             "opts": ("-u", "--summary"),
             "action": "store_true",
