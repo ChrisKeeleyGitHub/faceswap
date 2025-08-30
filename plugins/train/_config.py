@@ -5,7 +5,7 @@ import gettext
 import logging
 import os
 
-from lib.config import FaceswapConfig
+from lib.config import FaceswapConfig, ConfigValueType
 from plugins.plugin_loader import PluginLoader
 
 # LOCALES
@@ -108,6 +108,16 @@ class Config(FaceswapConfig):
         self._set_globals()
         self._set_loss()
         self._defaults_from_plugin(os.path.dirname(__file__))
+
+    @property
+    def config_dict(self) -> dict[str, ConfigValueType]:
+        """Return config merging PatchGAN sections into trainer config."""
+        conf = super().config_dict
+        if self.section == "trainer.patch_gan":
+            model_conf = Config("model.patch_gan", configfile=self.configfile).config_dict
+            for key, val in model_conf.items():
+                conf.setdefault(key, val)
+        return conf
 
     def _set_globals(self) -> None:
         """ Set the global options for training """
