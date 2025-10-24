@@ -46,7 +46,7 @@ class Model(OriginalModel):
         var_x = Conv2DOutput(3, 5, name=f"face_out_{side}")(var_x)
         outputs = [var_x]
 
-        if self.config.get("learn_mask", False):
+        if self.learn_mask:
             var_y = input_
             if self._output_size == 256:
                 var_y = UpscaleBlock(1024, activation="leakyrelu")(var_y)

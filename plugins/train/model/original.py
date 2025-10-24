@@ -44,6 +44,9 @@ class Model(ModelBase):
         self.low_mem = self.config.get("lowmem", False)
         self.learn_mask = self.config["learn_mask"]
         self.encoder_dim = 512 if self.low_mem else 1024
+        self.sides = ["a", "b"]
+        if self.config.get("third_side", False):
+            self.sides.append("c")
 
     def build_model(self, inputs):
         """ Create the model's structure.
@@ -68,8 +71,8 @@ class Model(ModelBase):
         Parameters
         ----------
         inputs: list
-            A list of input tensors for the model. This will be a list of 2 tensors of
-            shape :attr:`input_shape`, the first for side "a", the second for side "b".
+            A list of input tensors for the model. This will be a list of
+            ``len(self.sides)`` tensors of shape :attr:`input_shape`, one per configured side.
 
         Returns
         -------
@@ -79,17 +82,27 @@ class Model(ModelBase):
             argument in Faceswap. You should assign this to the attribute ``self.name`` that is
             automatically generated from the plugin's filename.
         """
-        input_a = inputs[0]
-        input_b = inputs[1]
+        if len(inputs) != len(self.sides):
+            raise ValueError("Number of inputs does not match configured sides: "
+                             f"{len(inputs)} provided for {len(self.sides)} sides")
 
         encoder = self.encoder()
-        encoder_a = [encoder(input_a)]
-        encoder_b = [encoder(input_b)]
+        decoders = {side: self.decoder(side) for side in self.sides}
+        outputs = []
 
-        outputs = self.decoder("a")(encoder_a) + self.decoder("b")(encoder_b)
+        for side, input_tensor in zip(self.sides, inputs):
+            encoded = encoder(input_tensor)
+            outputs.extend(decoders[side]([encoded]))
 
         autoencoder = KModel(inputs, outputs, name=self.model_name)
         return autoencoder
+
+    def _get_inputs(self):
+        """ Obtain model inputs for each configured side. """
+        input_shapes = [self.input_shape for _ in self.sides]
+        inputs = [Input(shape=shape, name=f"face_in_{side}")
+                  for side, shape in zip(self.sides, input_shapes)]
+        return inputs
 
     def encoder(self):
         """ The original Faceswap Encoder Network.
