@@ -49,7 +49,8 @@ _HELPTEXT = ("Original Trainer Options.\n"
 _DEFAULTS = dict(
     preview_images=dict(
         default=14,
-        info="Number of sample faces to display for each side in the preview when training.",
+        info="Number of sample faces to display for each configured side (A/B and optional C) "
+             "in the preview when training.",
         datatype=int,
         rounding=2,
         min_max=(2, 16),

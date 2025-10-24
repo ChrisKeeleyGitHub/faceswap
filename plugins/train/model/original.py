@@ -6,10 +6,15 @@ This model is heavily documented as it acts as a template that other model plugi
 from.
 """
 
+import logging
+
 from keras import Input, layers, Model as KModel
 
 from lib.model.nn_blocks import Conv2DOutput, Conv2DBlock, UpscaleBlock
 from ._base import ModelBase
+
+
+logger = logging.getLogger(__name__)
 
 
 class Model(ModelBase):
@@ -45,8 +50,17 @@ class Model(ModelBase):
         self.learn_mask = self.config["learn_mask"]
         self.encoder_dim = 512 if self.low_mem else 1024
         self.sides = ["a", "b"]
-        if self.config.get("third_side", False):
+        third_side_enabled = self.config.get("third_side", False)
+        has_input_c = bool(getattr(self.command_line_arguments, "input_c", None))
+        if third_side_enabled and not has_input_c:
+            logger.warning("The third decoder is enabled but no --input-C folder was provided. "
+                           "Disabling the additional side for this session.")
+            self.config["third_side"] = False
+        elif third_side_enabled and has_input_c:
             self.sides.append("c")
+        elif has_input_c and not third_side_enabled:
+            logger.warning("An --input-C folder was supplied but the third decoder is disabled. "
+                           "The extra dataset will not be used.")
 
     def build_model(self, inputs):
         """ Create the model's structure.

@@ -27,7 +27,8 @@ class TrainArgs(FaceSwapArgs):
         str
             The information text for the Train command.
         """
-        return _("Train a model on extracted original (A) and swap (B) faces.\n"
+        return _("Train a model on extracted original (A) and swap (B) faces, optionally adding "
+                 "a third dataset (C) when supported by the selected model.\n"
                  "Training models can take a long time. Anything from 24hrs to over a week\n"
                  "Model plugins can be configured in the 'Settings' Menu")
 
@@ -59,6 +60,16 @@ class TrainArgs(FaceSwapArgs):
             "help": _(
                 "Input directory. A directory containing training images for face B. This is the "
                 "swap face, i.e. the face that you want to place onto the head of person A.")})
+        argument_list.append({
+            "opts": ("-C", "--input-C"),
+            "action": DirFullPaths,
+            "dest": "input_c",
+            "required": False,
+            "default": None,
+            "group": _("faces"),
+            "help": _(
+                "Optional input directory for face C. Provide this when enabling the third "
+                "decoder in compatible models to train on an additional dataset.")})
         argument_list.append({
             "opts": ("-m", "--model-dir"),
             "action": DirFullPaths,
@@ -250,6 +261,15 @@ class TrainArgs(FaceSwapArgs):
                 "the input folder of 'B' faces that you would like to use for creating the "
                 "timelapse. You must also supply a --timelapse-output and a --timelapse-input-A "
                 "parameter.")})
+        argument_list.append({
+            "opts": ("-v", "--timelapse-input-C"),
+            "action": DirFullPaths,
+            "dest": "timelapse_input_c",
+            "default": None,
+            "group": _("timelapse"),
+            "help": _(
+                "Optional timelapse source for face C. Supply this when training with a third "
+                "decoder to capture time-lapse frames for side C.")})
         argument_list.append({
             "opts": ("-z", "--timelapse-output"),
             "action": DirFullPaths,

@@ -58,7 +58,9 @@ _DEFAULTS = dict(
     third_side=dict(
         default=False,
         info="Enable an additional 'C' decoder head. Existing checkpoints trained without this "
-             "option remain two-sided and are not compatible with the extra decoder.",
+             "option remain two-sided and are not compatible with the extra decoder. Provide an "
+             "--input-C folder when enabling this option to supply training data for the third "
+             "side.",
         datatype=bool,
         rounding=None,
         min_max=None,
