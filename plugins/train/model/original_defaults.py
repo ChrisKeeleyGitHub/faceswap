@@ -60,4 +60,16 @@ _DEFAULTS = dict(
         fixed=True,
         group="settings",
     ),
+    third_side=dict(
+        default=False,
+        info="Enable an additional 'C' decoder head. Existing checkpoints trained without this "
+             "option remain two-sided and are not compatible with the extra decoder.",
+        datatype=bool,
+        rounding=None,
+        min_max=None,
+        choices=[],
+        gui_radio=False,
+        fixed=True,
+        group="settings",
+    ),
 )
