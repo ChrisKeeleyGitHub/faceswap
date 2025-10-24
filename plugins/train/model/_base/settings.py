@@ -151,9 +151,20 @@ class Loss():
         outputs: list[:class:`keras.KerasTensor`]
             A list of output tensors from the model plugin
         """
-        # TODO Use output names if/when these are fixed upstream
-        split_outputs = [outputs[:len(outputs) // 2], outputs[len(outputs) // 2:]]
-        for side, side_output in zip(("a", "b"), split_outputs):
+        side_outputs: dict[str, list[KerasTensor]] = {}
+        sides_in_order: list[str] = []
+        for output in outputs:
+            name = output.name.split(":")[0]
+            parts = name.split("/")
+            base = parts[-2] if len(parts) > 1 else parts[0]
+            side = base.split("_")[-1]
+            if side not in side_outputs:
+                side_outputs[side] = []
+                sides_in_order.append(side)
+            side_outputs[side].append(output)
+
+        for side in sides_in_order:
+            side_output = side_outputs[side]
             output_names = [output.name for output in side_output]
             output_shapes = [output.shape[1:] for output in side_output]
             output_types = ["mask" if shape[-1] == 1 else "face" for shape in output_shapes]

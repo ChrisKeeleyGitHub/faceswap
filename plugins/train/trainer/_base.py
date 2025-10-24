@@ -32,6 +32,7 @@ if T.TYPE_CHECKING:
     from lib.config import ConfigValueType
 
 logger = logging.getLogger(__name__)
+SideLiteral = T.Literal["a", "b", "c"]
 
 
 def _get_config(plugin_name: str,
@@ -76,7 +77,7 @@ class TrainerBase():
 
     def __init__(self,
                  model: ModelBase,
-                 images: dict[T.Literal["a", "b"], list[str]],
+                 images: dict[SideLiteral, list[str]],
                  batch_size: int,
                  configfile: str | None) -> None:
         logger.debug("Initializing %s: (model: '%s', batch_size: %s)",
@@ -92,7 +93,8 @@ class TrainerBase():
 
         self._model.state.add_session_batchsize(batch_size)
         self._images = images
-        self._sides = sorted(key for key in self._images.keys())
+        sides = getattr(self._feeder, "sides", tuple(sorted(images.keys())))
+        self._sides: tuple[str, ...] = sides if isinstance(sides, tuple) else tuple(sides)
 
         self._tensorboard = self._set_tensorboard()
         self._samples = Samples(self._model,
@@ -210,10 +212,22 @@ class TrainerBase():
         """
         model_inputs, model_targets = self._feeder.get_batch()
         preds = self._model.model(model_inputs)
+        targets = list(flatten(model_targets))
+        pred_list = list(preds)
+        loss_functions = list(self._model.model.loss)
+
+        expected = len(targets)
+        if len(pred_list) != expected:
+            raise FaceswapError("Model prediction count does not match target count: "
+                                f"{len(pred_list)} vs {expected}")
+        if len(loss_functions) != expected:
+            raise FaceswapError("Configured loss functions do not match targets: "
+                                f"{len(loss_functions)} vs {expected}")
+
         losses = [loss_fn(y_true, y_pred)
-                  for loss_fn, y_true, y_pred in zip(self._model.model.loss,
-                                                     flatten(model_targets),
-                                                     preds)]
+                  for loss_fn, y_true, y_pred in zip(loss_functions,
+                                                     targets,
+                                                     pred_list)]
         logger.trace("Losses: %s", losses)  # type:ignore[attr-defined]
         return losses
 
@@ -227,9 +241,16 @@ class TrainerBase():
             The loss for each output from the model
         """
         self._model.model.zero_grad()
-        side_loss = [ops.sum(all_loss[:len(all_loss) // 2]),
-                     ops.sum(all_loss[len(all_loss) // 2:])]
-        for loss in side_loss:
+        num_sides = max(len(self._sides), 1)
+        if len(all_loss) % num_sides != 0:
+            raise FaceswapError("Loss outputs are not divisible by the configured sides")
+        outputs_per_side = len(all_loss) // num_sides
+        for idx in range(num_sides):
+            start = idx * outputs_per_side
+            side_losses = all_loss[start:start + outputs_per_side]
+            loss = side_losses[0]
+            for tensor in side_losses[1:]:
+                loss = ops.add(loss, tensor)
             loss = T.cast(torch.Tensor, self._model.model.optimizer.scale_loss(loss))
             loss.backward()
 
@@ -242,8 +263,7 @@ class TrainerBase():
 
     def train_one_step(self,
                        viewer: Callable[[np.ndarray, str], None] | None,
-                       timelapse_kwargs: dict[T.Literal["input_a", "input_b", "output"],
-                                              str] | None) -> None:
+                       timelapse_kwargs: dict[str, str] | None) -> None:
         """ Running training on a batch of images for each side.
 
         Triggered from the training cycle in :class:`scripts.train.Train`.
@@ -272,7 +292,7 @@ class TrainerBase():
         timelapse_kwargs: dict
             The keyword arguments for generating time-lapse previews. If a time-lapse preview is
             not required then this should be ``None``. Otherwise all values should be full paths
-            the keys being `input_a`, `input_b`, `output`.
+            keyed by ``input_<side>`` for each configured side alongside ``output``.
         """
         self._model.state.increment_iterations()
         logger.trace("Training one step: (iteration: %s)", self._model.iterations)  # type: ignore
@@ -314,8 +334,11 @@ class TrainerBase():
         if not self._tensorboard:
             return
         logger.trace("Updating TensorBoard log")  # type: ignore
-        logs = {log[0]: log[1]
-                for log in zip(self._model.state.loss_names, loss)}
+        loss_names = self._model.state.loss_names
+        if len(loss_names) != len(loss):
+            raise FaceswapError("Tensorboard loss names do not match loss outputs: "
+                                f"{len(loss_names)} vs {len(loss)}")
+        logs = dict(zip(loss_names, loss))
 
         self._tensorboard.on_train_batch_end(self._model.iterations, logs=logs)
 
@@ -349,8 +372,12 @@ class TrainerBase():
             raise FaceswapError("A NaN was detected and you have NaN protection enabled. Training "
                                 "has been terminated.")
 
-        split = len(loss) // 2
-        combined_loss = [sum(loss[:split]), sum(loss[split:])]
+        num_sides = max(len(self._sides), 1)
+        if len(loss) % num_sides != 0:
+            raise FaceswapError("Loss history cannot be collated for the configured sides")
+        outputs_per_side = len(loss) // num_sides
+        combined_loss = [sum(loss[idx * outputs_per_side:(idx + 1) * outputs_per_side])
+                         for idx in range(num_sides)]
         self._model.add_history(combined_loss)
         logger.trace("original loss: %s, combined_loss: %s", loss, combined_loss)  # type: ignore
         return combined_loss
@@ -364,16 +391,17 @@ class TrainerBase():
             The loss for each side. List should contain 2 ``floats`` side "a" in position 0 and
             side "b" in position `.
          """
-        output = ", ".join([f"Loss {side}: {side_loss:.5f}"
-                            for side, side_loss in zip(("A", "B"), loss)])
+        if len(loss) != len(self._sides):
+            raise FaceswapError("Displayed loss count does not match configured sides")
+        output = ", ".join([f"Loss {side.upper()}: {side_loss:.5f}"
+                            for side, side_loss in zip(self._sides, loss)])
         timestamp = time.strftime("%H:%M:%S")
         output = f"[{timestamp}] [#{self._model.iterations:05d}] {output}"
         print(f"{output}", end="\r")
 
     def _update_viewers(self,
                         viewer: Callable[[np.ndarray, str], None] | None,
-                        timelapse_kwargs: dict[T.Literal["input_a", "input_b", "output"],
-                                               str] | None) -> None:
+                        timelapse_kwargs: dict[str, str] | None) -> None:
         """ Update the preview viewer and timelapse output
 
         Parameters
@@ -383,7 +411,8 @@ class TrainerBase():
         timelapse_kwargs: dict
             The keyword arguments for generating time-lapse previews. If a time-lapse preview is
             not required then this should be ``None``. Otherwise all values should be full paths
-            the keys being `input_a`, `input_b`, `output`.
+            keyed by the required sides (e.g. ``input_a``, ``input_b``, ``input_c``) and
+            ``output``.
         """
         if viewer is not None:
             self._samples.images = self._feeder.generate_preview()

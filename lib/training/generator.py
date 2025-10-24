@@ -28,6 +28,28 @@ if T.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 BatchType = tuple[np.ndarray, list[np.ndarray]]
+SideLiteral = T.Literal["a", "b", "c"]
+
+
+def _get_model_sides(model: "ModelBase") -> tuple[str, ...]:
+    """Return the ordered sides configured on the provided model.
+
+    Parameters
+    ----------
+    model: :class:`~plugins.train.model._base.ModelBase`
+        The model for which sides should be retrieved.
+
+    Returns
+    -------
+    tuple[str, ...]
+        The ordered list of configured sides. Defaults to ("a", "b") for legacy
+        models that do not expose :attr:`sides`.
+    """
+
+    sides = getattr(model, "sides", None)
+    if sides:
+        return tuple(sides)
+    return ("a", "b")
 
 
 class DataGenerator():
@@ -53,14 +75,15 @@ class DataGenerator():
     """
     def __init__(self,
                  config: dict[str, ConfigValueType],
-                 model: ModelBase,
-                 side: T.Literal["a", "b"],
+                 model: "ModelBase",
+                 side: SideLiteral,
                  images: list[str],
                  batch_size: int) -> None:
         logger.debug("Initializing %s: (model: %s, side: %s, images: %s , "
                      "batch_size: %s, config: %s)", self.__class__.__name__, model.name, side,
                      len(images), batch_size, config)
         self._config = config
+        self._all_sides = _get_model_sides(model)
         self._side = side
         self._images = images
         self._batch_size = batch_size
@@ -114,8 +137,15 @@ class DataGenerator():
             A list of integers for the model output size for the current side
         """
         out_shapes = model.output_shapes
-        split = len(out_shapes) // 2
-        side_out = out_shapes[:split] if self._side == "a" else out_shapes[split:]
+        num_sides = max(len(self._all_sides), 1)
+        outputs_per_side = len(out_shapes) // num_sides or 1
+        try:
+            side_idx = self._all_sides.index(self._side)
+        except ValueError:
+            side_idx = 0
+        start = side_idx * outputs_per_side
+        stop = start + outputs_per_side
+        side_out = out_shapes[start:stop]
         retval = [shape[1] for shape in side_out if shape[-1] != 1]
         logger.debug("side: %s, model output shapes: %s, output sizes: %s",
                      self._side, model.output_shapes, retval)
@@ -414,8 +444,8 @@ class TrainingDataGenerator(DataGenerator):
     """
     def __init__(self,
                  config: dict[str, ConfigValueType],
-                 model: ModelBase,
-                 side: T.Literal["a", "b"],
+                 model: "ModelBase",
+                 side: SideLiteral,
                  images: list[str],
                  batch_size: int) -> None:
         super().__init__(config, model, side, images, batch_size)
@@ -564,7 +594,11 @@ class TrainingDataGenerator(DataGenerator):
         logger.trace(  # type:ignore[attr-defined]
             "Retrieving closest matched landmarks: (filenames: '%s', src_points: '%s')",
             filenames, batch_src_points)
-        lm_side: T.Literal["a", "b"] = "a" if self._side == "b" else "b"
+        other_sides = [side for side in self._all_sides if side != self._side]
+        if not other_sides:
+            raise FaceswapError("Warp to landmarks requires at least two configured sides")
+        lm_side: SideLiteral = T.cast(SideLiteral, other_sides[0] if len(other_sides) == 1
+                                     else choice(other_sides))
         other_cache = get_cache(lm_side)
         landmarks = other_cache.aligned_landmarks
 
@@ -573,8 +607,8 @@ class TrainingDataGenerator(DataGenerator):
                                for filename in filenames]
         except KeyError:
             # Resize mismatched training image size landmarks
-            sizes = {side: cache.size for side, cache in zip((self._side, lm_side),
-                                                             (self._face_cache, other_cache))}
+            sizes = {side: cache.size for side, cache in ((self._side, self._face_cache),
+                                                          (lm_side, other_cache))}
             if len(set(sizes.values())) > 1:
                 scale = sizes[self._side] / sizes[lm_side]
                 landmarks = {key: lms * scale for key, lms in landmarks.items()}
@@ -754,8 +788,8 @@ class Feeder():
         ``True`` to create a feeder for generating previews. Default: ``True``
     """
     def __init__(self,
-                 images: dict[T.Literal["a", "b"], list[str]],
-                 model: ModelBase,
+                 images: dict[SideLiteral, list[str]],
+                 model: "ModelBase",
                  batch_size: int,
                  config: dict[str, ConfigValueType],
                  include_preview: bool = True) -> None:
@@ -763,19 +797,27 @@ class Feeder():
                      "include_preview: %s)", self.__class__.__name__,
                      {k: len(v) for k, v in images.items()}, batch_size, config, include_preview)
         self._model = model
+        model_sides = _get_model_sides(model)
+        self._sides: tuple[SideLiteral, ...] = tuple(
+            T.cast(SideLiteral, side) for side in model_sides if side in images)
+        if not self._sides:
+            self._sides = tuple(T.cast(SideLiteral, side)
+                                for side in sorted(images.keys()))
         self._images = images
         self._batch_size = batch_size
         self._config = config
         self._feeds = {
             side: self._load_generator(side, False).minibatch_ab()
-            for side in T.get_args(T.Literal["a", "b"])}
+            for side in self._sides}
 
-        self._display_feeds = {"preview": self._set_preview_feed() if include_preview else {},
-                               "timelapse": {}}
+        self._display_feeds: dict[str, dict[SideLiteral, "Generator[BatchType, None, None]"]]
+        self._display_feeds = {
+            "preview": self._set_preview_feed() if include_preview else {},
+            "timelapse": {}}
         logger.debug("Initialized %s:", self.__class__.__name__)
 
     def _load_generator(self,
-                        side: T.Literal["a", "b"],
+                        side: SideLiteral,
                         is_display: bool,
                         batch_size: int | None = None,
                         images: list[str] | None = None) -> DataGenerator:
@@ -810,7 +852,7 @@ class Feeder():
                            self._batch_size if batch_size is None else batch_size)
         return retval
 
-    def _set_preview_feed(self) -> dict[T.Literal["a", "b"], Generator[BatchType, None, None]]:
+    def _set_preview_feed(self) -> dict[SideLiteral, Generator[BatchType, None, None]]:
         """ Set the preview feed for this feeder.
 
         Creates a generator from :class:`lib.training_data.PreviewDataGenerator` specifically
@@ -822,10 +864,10 @@ class Feeder():
             The side ("a" or "b") as key, :class:`~lib.training_data.PreviewDataGenerator` as
             value.
         """
-        retval: dict[T.Literal["a", "b"], Generator[BatchType, None, None]] = {}
+        retval: dict[SideLiteral, Generator[BatchType, None, None]] = {}
         num_images = self._config.get("preview_images", 14)
         assert isinstance(num_images, int)
-        for side in T.get_args(T.Literal["a", "b"]):
+        for side in self._sides:
             logger.debug("Setting preview feed: (side: '%s')", side)
             preview_images = min(max(num_images, 2), 16)
             batchsize = min(len(self._images[side]), preview_images)
@@ -847,7 +889,7 @@ class Feeder():
         """
         model_inputs: list[list[np.ndarray]] = []
         model_targets: list[list[np.ndarray]] = []
-        for side in ("a", "b"):
+        for side in self._sides:
             side_feed, side_targets = next(self._feeds[side])
             if self._model.config["learn_mask"]:  # Add the face mask as it's own target
                 side_targets += [side_targets[-1][..., 3][..., None]]
@@ -860,7 +902,7 @@ class Feeder():
         return model_inputs, model_targets
 
     def generate_preview(self, is_timelapse: bool = False
-                         ) -> dict[T.Literal["a", "b"], list[np.ndarray]]:
+                         ) -> dict[SideLiteral, list[np.ndarray]]:
         """ Generate the images for preview window or timelapse
 
         Parameters
@@ -878,20 +920,26 @@ class Feeder():
         logger.debug("Generating preview (is_timelapse: %s)", is_timelapse)
 
         batchsizes: list[int] = []
-        feed: dict[T.Literal["a", "b"], np.ndarray] = {}
-        samples: dict[T.Literal["a", "b"], np.ndarray] = {}
-        masks: dict[T.Literal["a", "b"], np.ndarray] = {}
+        feed: dict[SideLiteral, np.ndarray] = {}
+        samples: dict[SideLiteral, np.ndarray] = {}
+        masks: dict[SideLiteral, np.ndarray] = {}
 
         # MyPy can't recurse into nested dicts to get the type :(
-        iterator = T.cast(dict[T.Literal["a", "b"], "Generator[BatchType, None, None]"],
+        iterator = T.cast(dict[SideLiteral, "Generator[BatchType, None, None]"],
                           self._display_feeds["timelapse" if is_timelapse else "preview"])
-        for side in T.get_args(T.Literal["a", "b"]):
+        if not iterator:
+            raise FaceswapError("Preview feeds have not been initialized for the requested mode")
+        for side in self._sides:
+            if side not in iterator:
+                continue
             side_feed, side_samples = next(iterator[side])
             batchsizes.append(len(side_samples[0]))
             samples[side] = side_samples[0]
             feed[side] = side_feed[..., :3]
             masks[side] = side_feed[..., 3][..., None]
 
+        if not batchsizes:
+            raise FaceswapError("No preview data available for the requested mode")
         logger.debug("Generated samples: is_timelapse: %s, images: %s", is_timelapse,
                      {key: {k: v.shape for k, v in item.items()}
                       for key, item
@@ -900,10 +948,10 @@ class Feeder():
 
     def compile_sample(self,
                        image_count: int,
-                       feed: dict[T.Literal["a", "b"], np.ndarray],
-                       samples: dict[T.Literal["a", "b"], np.ndarray],
-                       masks: dict[T.Literal["a", "b"], np.ndarray]
-                       ) -> dict[T.Literal["a", "b"], list[np.ndarray]]:
+                       feed: dict[SideLiteral, np.ndarray],
+                       samples: dict[SideLiteral, np.ndarray],
+                       masks: dict[SideLiteral, np.ndarray]
+                       ) -> dict[SideLiteral, list[np.ndarray]]:
         """ Compile the preview samples for display.
 
         Parameters
@@ -929,8 +977,10 @@ class Feeder():
         num_images = self._config.get("preview_images", 14)
         assert isinstance(num_images, int)
         num_images = min(image_count, num_images)
-        retval: dict[T.Literal["a", "b"], list[np.ndarray]] = {}
-        for side in T.get_args(T.Literal["a", "b"]):
+        retval: dict[SideLiteral, list[np.ndarray]] = {}
+        for side in self._sides:
+            if side not in feed or side not in samples or side not in masks:
+                continue
             logger.debug("Compiling samples: (side: '%s', samples: %s)", side, num_images)
             retval[side] = [feed[side][0:num_images],
                             samples[side][0:num_images],
@@ -938,8 +988,14 @@ class Feeder():
         logger.debug("Compiled Samples: %s", {k: [i.shape for i in v] for k, v in retval.items()})
         return retval
 
+    @property
+    def sides(self) -> tuple[SideLiteral, ...]:
+        """The configured sides for this feeder."""
+
+        return self._sides
+
     def set_timelapse_feed(self,
-                           images: dict[T.Literal["a", "b"], list[str]],
+                           images: dict[SideLiteral, list[str]],
                            batch_size: int) -> None:
         """ Set the time-lapse feed for this feeder.
 
@@ -957,10 +1013,12 @@ class Feeder():
                      images, batch_size)
 
         # MyPy can't recurse into nested dicts to get the type :(
-        iterator = T.cast(dict[T.Literal["a", "b"], "Generator[BatchType, None, None]"],
+        iterator = T.cast(dict[SideLiteral, "Generator[BatchType, None, None]"],
                           self._display_feeds["timelapse"])
 
-        for side in T.get_args(T.Literal["a", "b"]):
+        for side in self._sides:
+            if side not in images:
+                continue
             imgs = images[side]
             logger.debug("Setting preview feed: (side: '%s', images: %s)", side, len(imgs))
 

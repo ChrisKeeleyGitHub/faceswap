@@ -6,13 +6,14 @@ import logging
 import time
 import typing as T
 import os
+from itertools import combinations
 
 import cv2
 import numpy as np
 import torch
 
 from lib.image import hex_to_rgb
-from lib.utils import get_folder, get_image_paths
+from lib.utils import FaceswapError, get_folder, get_image_paths
 
 if T.TYPE_CHECKING:
     from keras import KerasTensor
@@ -20,6 +21,16 @@ if T.TYPE_CHECKING:
     from plugins.train.model._base import ModelBase
 
 logger = logging.getLogger(__name__)
+SideLiteral = T.Literal["a", "b", "c"]
+
+
+def _get_model_sides(model: "ModelBase") -> tuple[str, ...]:
+    """Return the configured sides for the provided model."""
+
+    sides = getattr(model, "sides", None)
+    if sides:
+        return tuple(sides)
+    return ("a", "b")
 
 
 class Samples():
@@ -52,8 +63,9 @@ class Samples():
                      "mask_color: %s)",
                      self.__class__.__name__, model, coverage_ratio, mask_opacity, mask_color)
         self._model = model
+        self._sides: tuple[str, ...] = _get_model_sides(model)
         self._display_mask = model.config["learn_mask"] or model.config["penalized_mask_loss"]
-        self.images: dict[T.Literal["a", "b"], list[np.ndarray]] = {}
+        self.images: dict[SideLiteral, list[np.ndarray]] = {}
         self._coverage_ratio = coverage_ratio
         self._mask_opacity = mask_opacity / 100.0
         self._mask_color = np.array(hex_to_rgb(mask_color))[..., 2::-1] / 255.
@@ -68,30 +80,45 @@ class Samples():
         logger.info("Toggling mask display %s...", "on" if display_mask else "off")
         self._display_mask = display_mask
 
-    def show_sample(self) -> np.ndarray:
+    @property
+    def sides(self) -> tuple[str, ...]:
+        """The configured sides for the preview samples."""
+
+        return self._sides
+
+    def show_sample(self) -> np.ndarray | None:
         """ Compile a preview image.
 
         Returns
         -------
-        :class:`numpy.ndarry`
-            A compiled preview image ready for display or saving
+        :class:`numpy.ndarray` | None
+            A compiled preview image ready for display or saving or ``None`` if no data is
+            available
         """
         logger.debug("Showing sample")
-        feeds: dict[T.Literal["a", "b"], np.ndarray] = {}
-        for idx, side in enumerate(T.get_args(T.Literal["a", "b"])):
+        feeds: dict[SideLiteral, np.ndarray] = {}
+        model_input_shapes = list(self._model.model.input_shape)
+        for idx, side in enumerate(self._sides):
+            if side not in self.images or not self.images[side]:
+                continue
             feed = self.images[side][0]
-            input_shape = self._model.model.input_shape[idx][1:]
+            shape_idx = min(idx, len(model_input_shapes) - 1)
+            input_shape = model_input_shapes[shape_idx][1:]
             if input_shape[0] / feed.shape[1] != 1.0:
-                feeds[side] = self._resize_sample(side, feed, input_shape[0])
+                feeds[T.cast(SideLiteral, side)] = self._resize_sample(
+                    T.cast(SideLiteral, side), feed, input_shape[0])
             else:
-                feeds[side] = feed
+                feeds[T.cast(SideLiteral, side)] = feed
 
-        preds = self._get_predictions(feeds["a"], feeds["b"])
+        if not feeds:
+            return None
+
+        preds = self._get_predictions(feeds)
         return self._compile_preview(preds)
 
     @classmethod
     def _resize_sample(cls,
-                       side: T.Literal["a", "b"],
+                       side: SideLiteral,
                        sample: np.ndarray,
                        target_size: int) -> np.ndarray:
         """ Resize a given image to the target size.
@@ -99,7 +126,7 @@ class Samples():
         Parameters
         ----------
         side: str
-            The side ("a" or "b") that the samples are being generated for
+            The side that the samples are being generated for
         sample: :class:`numpy.ndarray`
             The sample to be resized
         target_size: int
@@ -122,159 +149,129 @@ class Samples():
         logger.debug("Resized sample: (side: '%s' shape: %s)", side, retval.shape)
         return retval
 
-    def _filter_multiscale_output(self, standard: list[KerasTensor], swapped: list[KerasTensor]
-                                  ) -> tuple[list[KerasTensor], list[KerasTensor]]:
-        """ Only return the largest predictions if the model has multi-scaled output
+    def _predict_for_inputs(self,
+                            model_inputs: list[np.ndarray],
+                            sides: list[str]) -> dict[SideLiteral, np.ndarray]:
+        """Run the model for the provided inputs and collate outputs per side."""
 
-        Parameters
-        ----------
-        standard: list[:class:`keras.KerasTensor`]
-            The standard output from the model
-        swapped: list[:class:`keras.KerasTensor`]
-            The swapped output from the model
-
-        Returns
-        -------
-        standard: list[:class:`keras.KerasTensor`]
-            The standard output from the model, filtered to just the largest output
-        swapped: list[:class:`keras.KerasTensor`]
-            The swapped output from the model, filtered to just the largest output
-        """
-        sizes = set(p.shape[1] for p in standard)
-        if len(sizes) == 1:
-            return standard, swapped
-        logger.debug("Received outputs. standard: %s, swapped: %s",
-                     [s.shape for s in standard], [s.shape for s in swapped])
-        logger.debug("Stripping multi-scale outputs for sizes %s", sizes)
-        standard = [s for s in standard if s.shape[1] == max(sizes)]
-        swapped = [s for s in swapped if s.shape[1] == max(sizes)]
-        logger.debug("Stripped outputs. standard: %s, swapped: %s",
-                     [s.shape for s in standard], [s.shape for s in swapped])
-        return standard, swapped
-
-    def _collate_output(self, standard: list[KerasTensor], swapped: list[KerasTensor]
-                        ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        """ Merge the mask onto the preview image's 4th channel if learn mask is selected.
-        Return as numpy array
-
-        Parameters
-        ----------
-        standard: list[:class:`keras.KerasTensor`]
-            The standard output from the model
-        swapped: list[:class:`keras.KerasTensor`]
-            The swapped output from the model
-
-        Returns
-        -------
-        standard: list[:class:`numpy.ndarray`]
-            The standard output from the model, with mask merged
-        swapped: list[:class:`numpy.ndarray`]
-            The swapped output from the model, with mask merged
-        """
-        logger.debug("Received tensors. standard: %s, swapped: %s",
-                     [s.shape for s in standard], [s.shape for s in swapped])
-
-        # Pull down outputs
-        standard = [p.cpu().detach().numpy() for p in standard]
-        swapped = [p.cpu().detach().numpy() for p in swapped]
-
-        if self._model.config["learn_mask"]:  # Add mask to 4th channel of final output
-            standard = [np.concatenate(standard[idx * 2: (idx * 2) + 2], axis=-1)
-                        for idx in range(2)]
-            swapped = [np.concatenate(swapped[idx * 2: (idx * 2) + 2], axis=-1)
-                       for idx in range(2)]
-        logger.debug("Collated output. standard: %s, swapped: %s",
-                     [(s.shape, s.dtype) for s in standard],
-                     [(s.shape, s.dtype) for s in swapped])
-        return standard, swapped
-
-    def _get_predictions(self, feed_a: np.ndarray, feed_b: np.ndarray
-                         ) -> dict[T.Literal["a_a", "a_b", "b_b", "b_a"], np.ndarray]:
-        """ Feed the samples to the model and return predictions
-
-        Parameters
-        ----------
-        feed_a: :class:`numpy.ndarray`
-            Feed images for the "a" side
-        feed_a: :class:`numpy.ndarray`
-            Feed images for the "b" side
-
-        Returns
-        -------
-        list:
-            List of :class:`numpy.ndarray` of predictions received from the model
-        """
-        logger.debug("Getting Predictions")
-        preds: dict[T.Literal["a_a", "a_b", "b_b", "b_a"], np.ndarray] = {}
+        if not sides:
+            return {}
 
         with torch.inference_mode():
-            standard = self._model.model([feed_a, feed_b])
-            swapped = self._model.model([feed_b, feed_a])
+            outputs = self._model.model(model_inputs)
 
-        standard, swapped = self._filter_multiscale_output(standard, swapped)
-        standard, swapped = self._collate_output(standard, swapped)
+        if not isinstance(outputs, (list, tuple)):
+            outputs = [outputs]
 
-        preds["a_a"] = standard[0]
-        preds["b_b"] = standard[1]
-        preds["a_b"] = swapped[0]
-        preds["b_a"] = swapped[1]
+        outputs_np = [output.cpu().detach().numpy() for output in outputs]
+        num_sides = len(sides)
+        if num_sides == 0:
+            return {}
+        if len(outputs_np) % num_sides != 0:
+            raise FaceswapError("Model outputs do not align with configured sides")
+        outputs_per_side = len(outputs_np) // num_sides
 
-        logger.debug("Returning predictions: %s", {key: val.shape for key, val in preds.items()})
+        retval: dict[SideLiteral, np.ndarray] = {}
+        for idx, side in enumerate(sides):
+            start = idx * outputs_per_side
+            side_outputs = outputs_np[start:start + outputs_per_side]
+            if not side_outputs:
+                continue
+            sizes = {output.shape[1] for output in side_outputs}
+            if len(sizes) > 1:
+                max_size = max(sizes)
+                side_outputs = [output for output in side_outputs if output.shape[1] == max_size]
+            merged = (side_outputs[0] if len(side_outputs) == 1
+                      else np.concatenate(side_outputs, axis=-1))
+            retval[T.cast(SideLiteral, side)] = merged
+
+        return retval
+
+    def _get_predictions(self, feeds: dict[SideLiteral, np.ndarray]
+                         ) -> dict[tuple[str, str], np.ndarray]:
+        """Feed the samples to the model and return predictions for each side."""
+
+        logger.debug("Getting Predictions")
+        active_sides = [side for side in self._sides if side in feeds]
+        if len(active_sides) < 2:
+            raise FaceswapError("At least two sides are required to generate preview predictions")
+
+        inputs = [feeds[T.cast(SideLiteral, side)] for side in active_sides]
+        standard = self._predict_for_inputs(inputs, active_sides)
+
+        preds: dict[tuple[str, str], np.ndarray] = {}
+        for side in active_sides:
+            preds[(side, side)] = standard[T.cast(SideLiteral, side)]
+
+        for idx, jdx in combinations(range(len(active_sides)), 2):
+            swap_inputs = inputs[:]
+            swap_inputs[idx], swap_inputs[jdx] = swap_inputs[jdx], swap_inputs[idx]
+            swapped = self._predict_for_inputs(swap_inputs, active_sides)
+            src = active_sides[idx]
+            dst = active_sides[jdx]
+            preds[(src, dst)] = swapped[T.cast(SideLiteral, dst)]
+            preds[(dst, src)] = swapped[T.cast(SideLiteral, src)]
+
+        logger.debug("Returning predictions: %s",
+                     {f"{src}_{dst}": val.shape for (src, dst), val in preds.items()})
         return preds
 
-    def _compile_preview(self, predictions: dict[T.Literal["a_a", "a_b", "b_b", "b_a"], np.ndarray]
+    def _compile_preview(self, predictions: dict[tuple[str, str], np.ndarray]
                          ) -> np.ndarray:
         """ Compile predictions and images into the final preview image.
 
         Parameters
         ----------
-        predictions: dict[Literal["a_a", "a_b", "b_b", "b_a"], np.ndarray
-            The predictions from the model
+        predictions: dict[(str, str), :class:`numpy.ndarray`]
+            The predictions from the model keyed by (source_side, target_side)
 
         Returns
         -------
         :class:`numpy.ndarry`
             A compiled preview image ready for display or saving
         """
-        figures: dict[T.Literal["a", "b"], np.ndarray] = {}
-        headers: dict[T.Literal["a", "b"], np.ndarray] = {}
+        panels: list[np.ndarray] = []
 
         for side, samples in self.images.items():
-            other_side = "a" if side == "b" else "b"
-            preds = [predictions[T.cast(T.Literal["a_a", "a_b", "b_b", "b_a"],
-                                        f"{side}_{side}")],
-                     predictions[T.cast(T.Literal["a_a", "a_b", "b_b", "b_a"],
-                                        f"{other_side}_{side}")]]
-            display = self._to_full_frame(side, samples, preds)
-            headers[side] = self._get_headers(side, display[0].shape[1])
-            figures[side] = np.stack([display[0], display[1], display[2], ], axis=1)
-            if self.images[side][1].shape[0] % 2 == 1:
-                figures[side] = np.concatenate([figures[side],
-                                                np.expand_dims(figures[side][0], 0)])
+            side_key = T.cast(SideLiteral, side)
+            if (side, side) not in predictions:
+                logger.debug("Skipping side '%s' due to missing self prediction", side)
+                continue
+            other_sides = [other for other in self._sides
+                           if other != side and (other, side) in predictions]
+            pred_list = [predictions[(side, side)]]
+            pred_list.extend(predictions[(other, side)] for other in other_sides)
+            display = self._to_full_frame(side_key, samples, pred_list)
+            if not display:
+                continue
 
-        width = 4
-        if width // 2 != 1:
-            headers = self._duplicate_headers(headers, width // 2)
+            rows = [np.concatenate(row_images, axis=1)
+                    for row_images in zip(*display)]
+            if not rows:
+                continue
+            grid = np.concatenate(rows, axis=0)
+            header = self._get_headers(side_key,
+                                       display[0].shape[1],
+                                       other_sides)
+            panels.append(np.concatenate((header, grid), axis=0))
 
-        header = np.concatenate([headers["a"], headers["b"]], axis=1)
-        figure = np.concatenate([figures["a"], figures["b"]], axis=0)
-        height = int(figure.shape[0] / width)
-        figure = figure.reshape((width, height) + figure.shape[1:])
-        figure = _stack_images(figure)
-        figure = np.concatenate((header, figure), axis=0)
+        if not panels:
+            raise FaceswapError("No preview panels could be generated")
+
+        figure = np.concatenate(panels, axis=0)
 
         logger.debug("Compiled sample")
         return np.clip(figure * 255, 0, 255).astype('uint8')
 
     def _to_full_frame(self,
-                       side: T.Literal["a", "b"],
+                       side: SideLiteral,
                        samples: list[np.ndarray],
                        predictions: list[np.ndarray]) -> list[np.ndarray]:
         """ Patch targets and prediction images into images of model output size.
 
         Parameters
         ----------
-        side: {"a" or "b"}
+        side: str
             The side that these samples are for
         samples: list
             List of :class:`numpy.ndarray` of feed images and sample images
@@ -309,7 +306,7 @@ class Samples():
         return images
 
     def _process_full(self,
-                      side: T.Literal["a", "b"],
+                      side: SideLiteral,
                       images: np.ndarray,
                       prediction_size: int,
                       color: tuple[float, float, float]) -> np.ndarray:
@@ -415,7 +412,7 @@ class Samples():
         return backgrounds
 
     @classmethod
-    def _get_headers(cls, side: T.Literal["a", "b"], width: int) -> np.ndarray:
+    def _get_headers(cls, side: SideLiteral, width: int, other_sides: list[str]) -> np.ndarray:
         """ Set header row for the final preview frame
 
         Parameters
@@ -430,26 +427,25 @@ class Samples():
         :class:`numpy.ndarray`
             The column headings for the given side
         """
-        logger.debug("side: '%s', width: %s",
-                     side, width)
-        titles = ("Original", "Swap") if side == "a" else ("Swap", "Original")
+        logger.debug("side: '%s', width: %s, other_sides: %s",
+                     side, width, other_sides)
+        titles = [f"Original ({side.upper()})", f"{side.upper()} > {side.upper()}"]
+        titles.extend(f"{other.upper()} > {side.upper()}" for other in other_sides)
         height = int(width / 4.5)
-        total_width = width * 3
+        total_width = width * len(titles)
         logger.debug("height: %s, total_width: %s", height, total_width)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        texts = [f"{titles[0]} ({side.upper()})",
-                 f"{titles[0]} > {titles[0]}",
-                 f"{titles[0]} > {titles[1]}"]
         scaling = (width / 144) * 0.45
-        text_sizes = [cv2.getTextSize(texts[idx], font, scaling, 1)[0]
-                      for idx in range(len(texts))]
-        text_y = int((height + text_sizes[0][1]) / 2)
+        text_sizes = [cv2.getTextSize(text, font, scaling, 1)[0]
+                      for text in titles]
+        tallest = max(text_sizes, key=lambda size: size[1])[1]
+        text_y = int((height + tallest) / 2)
         text_x = [int((width - text_sizes[idx][0]) / 2) + width * idx
-                  for idx in range(len(texts))]
+                  for idx in range(len(titles))]
         logger.debug("texts: %s, text_sizes: %s, text_x: %s, text_y: %s",
-                     texts, text_sizes, text_x, text_y)
+                     titles, text_sizes, text_x, text_y)
         header_box = np.ones((height, total_width, 3), np.float32)
-        for idx, text in enumerate(texts):
+        for idx, text in enumerate(titles):
             cv2.putText(header_box,
                         text,
                         (text_x[idx], text_y),
@@ -460,31 +456,6 @@ class Samples():
                         lineType=cv2.LINE_AA)
         logger.debug("header_box.shape: %s", header_box.shape)
         return header_box
-
-    @classmethod
-    def _duplicate_headers(cls,
-                           headers: dict[T.Literal["a", "b"], np.ndarray],
-                           columns: int) -> dict[T.Literal["a", "b"], np.ndarray]:
-        """ Duplicate headers for the number of columns displayed for each side.
-
-        Parameters
-        ----------
-        headers: dict
-            The headers to be duplicated for each side
-        columns: int
-            The number of columns that the header needs to be duplicated for
-
-        Returns
-        -------
-        :class:dict
-            The original headers duplicated by the number of columns for each side
-        """
-        for side, header in headers.items():
-            duped = tuple(header for _ in range(columns))
-            headers[side] = np.concatenate(duped, axis=1)
-            logger.debug("side: %s header.shape: %s", side, header.shape)
-        return headers
-
 
 class Timelapse():
     """ Create a time-lapse preview image.
@@ -513,28 +484,25 @@ class Timelapse():
                  mask_opacity: int,
                  mask_color: str,
                  feeder: Feeder,
-                 image_paths: dict[T.Literal["a", "b"], list[str]]) -> None:
+                 image_paths: dict[SideLiteral, list[str]]) -> None:
         logger.debug("Initializing %s: model: %s, coverage_ratio: %s, image_count: %s, "
                      "mask_opacity: %s, mask_color: %s, feeder: %s, image_paths: %s)",
                      self.__class__.__name__, model, coverage_ratio, image_count, mask_opacity,
                      mask_color, feeder, len(image_paths))
         self._num_images = image_count
         self._samples = Samples(model, coverage_ratio, mask_opacity, mask_color)
+        self._sides = self._samples.sides
         self._model = model
         self._feeder = feeder
         self._image_paths = image_paths
         self._output_file = ""
         logger.debug("Initialized %s", self.__class__.__name__)
 
-    def _setup(self, input_a: str, input_b: str, output: str) -> None:
+    def _setup(self, output: str | None = None, **inputs: str) -> None:
         """ Setup the time-lapse folder locations and the time-lapse feed.
 
         Parameters
         ----------
-        input_a: str
-            The full path to the time-lapse input folder containing faces for the "a" side
-        input_b: str
-            The full path to the time-lapse input folder containing faces for the "b" side
         output: str, optional
             The full path to the time-lapse output folder. If ``None`` is provided this will
             default to the model folder
@@ -547,21 +515,25 @@ class Timelapse():
         logger.debug("Time-lapse output set to '%s'", self._output_file)
 
         # Rewrite paths to pull from the training images so mask and face data can be accessed
-        images: dict[T.Literal["a", "b"], list[str]] = {}
-        for side, input_ in zip(T.get_args(T.Literal["a", "b"]), (input_a, input_b)):
-            training_path = os.path.dirname(self._image_paths[side][0])
-            images[side] = [os.path.join(training_path, os.path.basename(pth))
-                            for pth in get_image_paths(input_)]
+        images: dict[SideLiteral, list[str]] = {}
+        for side in self._sides:
+            key = f"input_{side}"
+            input_path = inputs.get(key)
+            if not input_path or side not in self._image_paths:
+                continue
+            training_path = os.path.dirname(self._image_paths[T.cast(SideLiteral, side)][0])
+            images[T.cast(SideLiteral, side)] = [
+                os.path.join(training_path, os.path.basename(pth))
+                for pth in get_image_paths(input_path)]
 
-        batchsize = min(len(images["a"]),
-                        len(images["b"]),
-                        self._num_images)
+        if not images:
+            raise FaceswapError("No timelapse inputs were provided for the configured sides")
+
+        batchsize = min(*(len(img_list) for img_list in images.values()), self._num_images)
         self._feeder.set_timelapse_feed(images, batchsize)
         logger.debug("Set up time-lapse")
 
-    def output_timelapse(self, timelapse_kwargs: dict[T.Literal["input_a",
-                                                                "input_b",
-                                                                "output"], str]) -> None:
+    def output_timelapse(self, timelapse_kwargs: dict[str, str]) -> None:
         """ Generate the time-lapse samples and output the created time-lapse to the specified
         output folder.
 
@@ -569,11 +541,11 @@ class Timelapse():
         ----------
         timelapse_kwargs: dict:
             The keyword arguments for setting up the time-lapse. All values should be full paths
-            the keys being `input_a`, `input_b`, `output`
+            keyed by ``input_<side>`` for each configured side alongside ``output``
         """
         logger.debug("Ouputting time-lapse")
         if not self._output_file:
-            self._setup(**T.cast(dict[str, str], timelapse_kwargs))
+            self._setup(**timelapse_kwargs)
 
         logger.debug("Getting time-lapse samples")
         self._samples.images = self._feeder.generate_preview(is_timelapse=True)
