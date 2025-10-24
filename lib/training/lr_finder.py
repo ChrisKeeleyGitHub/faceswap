@@ -11,9 +11,11 @@ from enum import Enum
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from keras.src.tree import flatten
 from tqdm import tqdm
 
 from lib.logger import parse_class_init
+from lib.utils import FaceswapError
 
 if T.TYPE_CHECKING:
     from keras import optimizers
@@ -127,7 +129,14 @@ class LearningRateFinder:
                     leave=False)
         for idx in pbar:
             model_inputs, model_targets = self._feeder.get_batch()
-            loss: list[float] = self._model.model.train_on_batch(model_inputs, y=model_targets)
+            loss_raw = self._model.model.train_on_batch(model_inputs, y=model_targets)
+            loss: list[float] = (list(loss_raw)
+                                 if isinstance(loss_raw, (list, tuple))
+                                 else [loss_raw])
+            expected = 1 + len(list(flatten(model_targets)))
+            if len(loss) != expected:
+                raise FaceswapError("Learning rate finder received an unexpected number of "
+                                    f"loss values: {len(loss)} (expected {expected})")
             if np.isnan(loss[0]):
                 break
             self._on_batch_end(idx, loss[0])
