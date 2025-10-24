@@ -29,6 +29,7 @@ if T.TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+SideLiteral = T.Literal["a", "b", "c"]
 
 
 class Train():
@@ -67,7 +68,7 @@ class Train():
 
         logger.debug("Initialized %s", self.__class__.__name__)
 
-    def _get_images(self) -> dict[T.Literal["a", "b"], list[str]]:
+    def _get_images(self) -> dict[SideLiteral, list[str]]:
         """ Check the image folders exist and contains valid extracted faces. Obtain image paths.
 
         Returns
@@ -77,9 +78,12 @@ class Train():
             for that side.
         """
         logger.debug("Getting image paths")
-        images = {}
-        for side in ("a", "b"):
-            side = T.cast(T.Literal["a", "b"], side)
+        images: dict[SideLiteral, list[str]] = {}
+        sides: list[SideLiteral] = ["a", "b"]
+        if getattr(self._args, "input_c", None):
+            sides.append(T.cast(SideLiteral, "c"))
+
+        for side in sides:
             image_dir = getattr(self._args, f"input_{side}")
             if not os.path.isdir(image_dir):
                 logger.error("Error: '%s' does not exist", image_dir)
@@ -108,7 +112,7 @@ class Train():
         return images
 
     @classmethod
-    def _validate_image_counts(cls, images: dict[T.Literal["a", "b"], list[str]]) -> None:
+    def _validate_image_counts(cls, images: dict[SideLiteral, list[str]]) -> None:
         """ Validate that there are sufficient images to commence training without raising an
         error.
 
@@ -136,7 +140,7 @@ class Train():
                            "Results are likely to be poor.")
             logger.warning(msg)
 
-    def _set_timelapse(self) -> dict[T.Literal["input_a", "input_b", "output"], str]:
+    def _set_timelapse(self) -> dict[str, str]:
         """ Set time-lapse paths if requested.
 
         Returns
@@ -145,12 +149,15 @@ class Train():
             The time-lapse keyword arguments for passing to the trainer
 
         """
-        if (not self._args.timelapse_input_a and
-                not self._args.timelapse_input_b and
-                not self._args.timelapse_output):
+        timelapse_inputs: dict[str, str | None] = {
+            "a": getattr(self._args, "timelapse_input_a", None),
+            "b": getattr(self._args, "timelapse_input_b", None),
+            "c": getattr(self._args, "timelapse_input_c", None)}
+
+        if not any(timelapse_inputs.values()) and not self._args.timelapse_output:
             return {}
-        if (not self._args.timelapse_input_a or
-                not self._args.timelapse_input_b or
+        if (not timelapse_inputs["a"] or
+                not timelapse_inputs["b"] or
                 not self._args.timelapse_output):
             raise FaceswapError("To enable the timelapse, you have to supply all the parameters "
                                 "(--timelapse-input-A, --timelapse-input-B and "
@@ -158,9 +165,12 @@ class Train():
 
         timelapse_output = get_folder(self._args.timelapse_output)
 
-        for side in ("a", "b"):
-            side = T.cast(T.Literal["a", "b"], side)
-            folder = getattr(self._args, f"timelapse_input_{side}")
+        for side, folder in timelapse_inputs.items():
+            if folder is None:
+                continue
+            if side == "c" and side not in self._images:
+                raise FaceswapError("A timelapse input was supplied for side 'C' without "
+                                    "providing --input-C data.")
             if folder is not None and not os.path.isdir(folder):
                 raise FaceswapError(f"The Timelapse path '{folder}' does not exist")
 
@@ -176,15 +186,16 @@ class Train():
 
             # Time-lapse images must appear in the training set, as we need access to alignment and
             # mask info. Check filenames are there to save failing much later in the process.
-            training_images = [os.path.basename(img) for img in self._images[side]]
+            training_images = [os.path.basename(img) for img in self._images[T.cast(SideLiteral, side)]]
             if not all(img in training_images for img in filenames):
                 raise FaceswapError(f"All images in the Timelapse folder '{folder}' must exist in "
                                     f"the training folder '{training_folder}'")
 
-        TKey = T.Literal["input_a", "input_b", "output"]
-        kwargs = {T.cast(TKey, "input_a"): self._args.timelapse_input_a,
-                  T.cast(TKey, "input_b"): self._args.timelapse_input_b,
-                  T.cast(TKey, "output"): timelapse_output}
+        kwargs: dict[str, str] = {"input_a": T.cast(str, timelapse_inputs["a"]),
+                                  "input_b": T.cast(str, timelapse_inputs["b"]),
+                                  "output": timelapse_output}
+        if timelapse_inputs["c"]:
+            kwargs["input_c"] = T.cast(str, timelapse_inputs["c"])
         logger.debug("Timelapse enabled: %s", kwargs)
         return kwargs
 
@@ -281,9 +292,24 @@ class Train():
             model_dir,
             self._args,
             predict=False)
+        if not self._args.summary:
+            self._persist_dataset_paths(model)
         model.build()
         logger.debug("Loaded Model")
         return model
+
+    def _persist_dataset_paths(self, model: "ModelBase") -> None:
+        """Store the dataset paths used for this session in the model state."""
+
+        datasets = model.state.current_session.setdefault("datasets", {})
+        for side in ("a", "b", "c"):
+            key = f"input_{side}"
+            path = getattr(self._args, key, None)
+            if path:
+                datasets[key] = path
+            else:
+                datasets.pop(key, None)
+        model.state.save()
 
     def _load_trainer(self, model: ModelBase) -> TrainerBase:
         """ Load the trainer requested for training.
